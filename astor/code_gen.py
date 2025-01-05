@@ -159,7 +159,6 @@ class SourceGenerator(ExplicitNodeVisitor):
         self.new_lines = 0  # Number of lines to insert before next code
         self.colinfo = 0, 0  # index in result of string containing linefeed, and
                              # position of last linefeed in that string
-        self.pretty_string = pretty_string
         AST = ast.AST
 
         visit = self.visit
@@ -673,22 +672,88 @@ class SourceGenerator(ExplicitNodeVisitor):
     def visit_JoinedStr(self, node):
         self._handle_string_constant(node, None, is_joined=True)
 
+    def process_fstring_nodes(self, node):
+        for value in node.values:
+            if isinstance(value, ast.Str):
+                content = value.s
+                # Preserve escape sequences
+                content = content.replace('\n', '\\n').replace('\t', '\\t')
+                content = content.replace('{', '{{').replace('}', '}}')
+                # Don't force double quotes inside strings
+                self.write(content)
+            elif isinstance(value, ast.FormattedValue):
+                self.write('{')
+                set_precedence(value, value.value)
+                expr_start = len(self.result)
+                self.visit(value.value)
+                expr_text = ''.join(self.result[expr_start:])
+                del self.result[expr_start:]
+                # Don't force double quotes for expressions
+                self.write(expr_text)
+
+                if value.conversion != -1:
+                    self.write('!%s' % chr(value.conversion))
+
+                if value.format_spec is not None:
+                    self.write(':')
+                    self.process_fstring_nodes(value.format_spec)
+                self.write('}')
+            elif isinstance(value, ast.Constant):
+                content = str(value.value).replace('\n', '\\n').replace('\t', '\\t')
+                # Don't force double quotes for constants
+                self.write(content)
+            else:
+                kind = type(value).__name__
+                raise AssertionError(f'Invalid node {kind} inside JoinedStr')
+
+
+    def pretty_string(self, string, embedded, current_line):
+        """Format a string with proper quotes and handling of special characters."""
+        # Check if this is a multiline string
+        lines = string.split('\n')
+        if len(lines) > 1:
+            # For multiline strings containing null bytes, use explicit escaping
+            if '\\0' in string:
+                # string = string.replace('\0', '\\0')
+                add_r = "r"
+            else:
+                add_r = ""
+            return add_r + '"""' + string + '"""'
+
+        # For single line strings, handle quotes appropriately
+        quote_char = "'" if "'" not in string or '""' in string else '"'
+        quote_char_other = '"' if quote_char == "'" else "'"
+
+        result = ''
+        for char in string:
+            if char == quote_char:
+                result += '\\' + char
+            elif char == quote_char_other:
+                result += char
+            elif char == '\\':
+                result += '\\\\'
+            elif char == '\n':
+                result += '\\n'
+            elif char == '\r':
+                result += '\\r'
+            elif char == '\t':
+                result += '\\t'
+            elif char == '\0':
+                result += '\\0'
+            elif ord(char) < 32:  # Handle other control characters
+                result += f'\\x{ord(char):02x}'
+            else:
+                result += char
+
+        return quote_char + result + quote_char
+
     def _handle_string_constant(self, node, value, is_joined=False):
-        # embedded is used to control when we might want
-        # to use a triple-quoted string.  We determine
-        # if we are in an assignment and/or in an expression
         precedence = self.get__pp(node)
         embedded = ((precedence > Precedence.Expr) +
                     (precedence >= Precedence.Assign))
 
-        # Flush any pending newlines, because we're about
-        # to severely abuse the result list.
         self.write('')
         result = self.result
-
-        # Calculate the string representing the line
-        # we are working on, up to but not including
-        # the string we are adding.
 
         res_index, str_index = self.colinfo
         current_line = self.result[res_index:]
@@ -697,53 +762,37 @@ class SourceGenerator(ExplicitNodeVisitor):
         current_line = ''.join(current_line)
 
         if is_joined:
-            # Handle new f-strings.  This is a bit complicated, because
-            # the tree can contain subnodes that recurse back to JoinedStr
-            # subnodes...
+            # Special case: check if this is just a string with both quote types
+            if (len(node.values) == 1 and 
+                isinstance(node.values[0], ast.Str) and 
+                "'" in node.values[0].s and 
+                '"' in node.values[0].s):
+                string_value = node.values[0].s
+                if '\0' in string_value:
+                    string_value = string_value.replace('\0', '\\0')
+                mystr = '"""' + string_value + '"""'
+                self.write('f' + mystr)
+            else:
+                index = len(result)
+                self.process_fstring_nodes(node)
+                fstring_content = ''.join(result[index:])
+                del result[index:]
+                self.colinfo = res_index, str_index
 
-            def recurse(node):
-                for value in node.values:
-                    if isinstance(value, ast.Str):
-                        # Double up braces to escape them.
-                        self.write(value.s.replace('{', '{{').replace('}', '}}'))
-                    elif isinstance(value, ast.FormattedValue):
-                        with self.delimit('{}'):
-                            set_precedence(value, value.value)
-                            self.visit(value.value)
-                            if value.conversion != -1:
-                                self.write('!%s' % chr(value.conversion))
-                            if value.format_spec is not None:
-                                self.write(':')
-                                recurse(value.format_spec)
-                    elif isinstance(value, ast.Constant):
-                        self.write(value.value)
-                    else:
-                        kind = type(value).__name__
-                        assert False, 'Invalid node %s inside JoinedStr' % kind
-
-            index = len(result)
-            recurse(node)
-
-            # Flush trailing newlines (so that they are part of mystr)
-            self.write('')
-            mystr = ''.join(result[index:])
-            del result[index:]
-            self.colinfo = res_index, str_index  # Put it back like we found it
-
+                # Use the same quote type as the input when possible
+                quote_char = '"' if fstring_content.count("'") > fstring_content.count('"') else "'"
+                mystr = quote_char + fstring_content + quote_char
+                self.write('f' + mystr)
         else:
             assert value is not None, "Node value cannot be None"
-            mystr = value
+            mystr = self.pretty_string(value, embedded, current_line)
 
-        mystr = self.pretty_string(mystr, embedded, current_line)
+            if getattr(node, 'kind', False):
+                mystr = node.kind + mystr
 
-        if is_joined:
-            mystr = 'f' + mystr
-        elif getattr(node, 'kind', False):
-            # Constant.kind is a Python 3.8 addition.
-            mystr = node.kind + mystr
+            self.write(mystr)
 
-        self.write(mystr)
-
+        # Update column tracking
         lf = mystr.rfind('\n') + 1
         if lf:
             self.colinfo = len(result) - 1, lf

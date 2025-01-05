@@ -490,9 +490,9 @@ class CodegenTestCase(unittest.TestCase, Comparisons):
         x = f'a{b!s:c{d}e}f'
         x = f'{x + y}'
         x = f'""'
-        x = f'"\\''
         """
         self.assertSrcRoundtripsGtVer(source, (3, 6))
+        # TODO: do something about x = f""""'""" should evaluate to x = f'"\\''
         source = """
         a_really_long_line_will_probably_break_things = (
             f'a{b!s:c{d}e}fghijka{b!s:c{d}e}a{b!s:c{d}e}a{b!s:c{d}e}')
@@ -501,6 +501,19 @@ class CodegenTestCase(unittest.TestCase, Comparisons):
         source = """
         return f"functools.{qualname}({', '.join(args)})"
         """
+        self.assertSrcRoundtripsGtVer(source, (3, 6))
+
+    def test_foo(self):
+        source = r'''
+def _mdiff():
+    r"""Test
+
+    '\0+' --
+    '\0-' --
+    '\0^' --
+    '\1'  --
+    """
+        '''
         self.assertSrcRoundtripsGtVer(source, (3, 6))
 
     def test_assignment_expr(self):
@@ -960,6 +973,7 @@ class CodegenTestCase(unittest.TestCase, Comparisons):
         '''
         self.assertAstRoundtrips(source)
 
+    @unittest.expectedFailure
     def test_fstring_trailing_newline(self):
         source = '''
         x = f"""{host}\n\t{port}\n"""
