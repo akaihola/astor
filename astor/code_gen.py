@@ -23,8 +23,115 @@ import math
 
 from .op_util import get_op_symbol, get_op_precedence, Precedence
 from .node_util import ExplicitNodeVisitor
-from .string_repr import pretty_string
+# from .string_repr import pretty_string
 from .source_repr import pretty_source
+
+
+def escape_string(s: str, quote_char: str = '"', is_docstring: bool = False) -> str:
+    """
+    Comprehensively escape a Python string, handling all special characters.
+    Preserves newlines in docstrings.
+
+    Args:
+        s: The input string to escape
+        quote_char: The quote character to use (either ' or ")
+        is_docstring: Whether this string is a docstring
+
+    Returns:
+        Properly escaped string that can be safely represented in Python code
+    """
+    result = []
+    i = 0
+    length = len(s)
+
+    # Common escape sequences
+    escape_dict = {
+        '\r': '\\r',
+        '\t': '\\t',
+        '\f': '\\f',
+        '\b': '\\b',
+        '\a': '\\a',
+        '\v': '\\v',
+        '\\': '\\\\',
+        '\0': '\\0',
+    }
+
+    # Add \n to escape_dict only if this is not a docstring
+    if not is_docstring:
+        escape_dict['\n'] = '\\n'
+
+    while i < length:
+        char = s[i]
+
+        # Handle quotes
+        if char == quote_char and not is_docstring:  # TODO: added doc string check
+            result.append('\\' + char)
+        # Handle predefined escape sequences
+        elif char in escape_dict:
+            result.append(escape_dict[char])
+        # Handle newlines in docstrings
+        elif char == '\n' and is_docstring:
+            result.append(char)
+        # Handle non-printable ASCII characters
+        elif ord(char) < 32 or ord(char) == 127:
+            if char != '\n' or not is_docstring:  # Don't escape newline in docstrings
+                result.append(f'\\x{ord(char):02x}')
+            else:
+                result.append(char)
+        # Handle non-ASCII characters
+        elif ord(char) > 127:
+            # Use short form if possible
+            if ord(char) <= 0xFFFF:
+                result.append(f'\\u{ord(char):04x}')
+            else:
+                result.append(f'\\U{ord(char):08x}')
+        # Handle already escaped sequences
+        elif char == '\\' and i + 1 < length:
+            next_char = s[i + 1]
+            chars = {'n', 'r', 't', '0', '1', 'x', 'u', 'U', '\\', '"', "'"}
+            #if is_docstring:
+            #    chars -= {'"', "'"}
+            if next_char in chars:
+                result.append('\\\\' + next_char)
+                i += 1
+            else:
+                result.append(char)
+        else:
+            result.append(char)
+        i += 1
+
+    return ''.join(result)
+
+def pretty_string(string: str, embedded: bool = False, current_line: str = '', is_docstring: bool = False) -> str:
+    """
+    Format a string with proper quotes and comprehensive escape handling.
+
+    Args:
+        string: The input string to format
+        embedded: Whether the string is embedded in an expression
+        current_line: The current line being processed
+        is_docstring: Whether this string is a docstring
+
+    Returns:
+        Properly formatted string with appropriate quotes and escaping
+    """
+    # Handle empty strings
+    if not string:
+        # TODO: Add this for this
+        return '""' if '"' in current_line else "''"
+
+    # Check if this is a multiline string
+    lines = string.splitlines(keepends=True)
+    if len(lines) > 1 or is_docstring:
+        # For multiline strings and docstrings, use triple quotes and escape any embedded triple quotes
+        escaped = escape_string(string, '"', is_docstring=True)
+        if '"""' in escaped:
+            escaped = escaped.replace('"""', '\\"\\"\\"')
+        return f'"""{escaped}"""'
+
+    # For single line strings, choose quotes based on content
+    quote_char = "'" if "'" not in string or '"""' in string else '"'
+    return quote_char + escape_string(string, quote_char, is_docstring=False) + quote_char
 
 
 def to_source(node, indent_with=' ' * 4, add_line_information=False,
@@ -220,9 +327,22 @@ class SourceGenerator(ExplicitNodeVisitor):
             self.new_lines = 1
 
     def body(self, statements):
-        self.indentation += 1
-        self.write(*statements)
-        self.indentation -= 1
+        #self.indentation += 1
+        #self.write(*statements)
+        #self.indentation -= 1
+        if statements and isinstance(statements[0], ast.Expr) and \
+           isinstance(statements[0].value, ast.Constant) and \
+           isinstance(statements[0].value.value, str):
+            # Handle the docstring
+            self.indentation += 1
+            self._handle_string_constant(statements[0].value, statements[0].value.value, is_joined=False, is_docstring=True)
+            self.write(*statements[1:])  # Handle remaining statements normally
+            self.indentation -= 1
+        else:
+            # No docstring - handle all statements normally
+            self.indentation += 1
+            self.write(*statements)
+            self.indentation -= 1
 
     def else_body(self, elsewhat):
         if elsewhat:
@@ -367,6 +487,7 @@ class SourceGenerator(ExplicitNodeVisitor):
         self.conditional_write(' -> ', self.get_returns(node))
         self.write(':')
         self.add_type_comment(node)
+        self.newline()
         self.body(node.body)
         if not self.indentation:
             self.newline(extra=2)
@@ -397,6 +518,7 @@ class SourceGenerator(ExplicitNodeVisitor):
         self.conditional_write(paren_or_comma, '*', self.get_starargs(node))
         self.conditional_write(paren_or_comma, '**', self.get_kwargs(node))
         self.write(have_args and '):' or ':')
+        self.newline()
         self.body(node.body)
         if not self.indentation:
             self.newline(extra=2)
@@ -675,6 +797,7 @@ class SourceGenerator(ExplicitNodeVisitor):
     def process_fstring_nodes(self, node):
         for value in node.values:
             if isinstance(value, ast.Str):
+                #print("str", value.s)
                 content = value.s
                 # Preserve escape sequences
                 content = content.replace('\n', '\\n').replace('\t', '\\t')
@@ -706,48 +829,7 @@ class SourceGenerator(ExplicitNodeVisitor):
                 kind = type(value).__name__
                 raise AssertionError(f'Invalid node {kind} inside JoinedStr')
 
-
-    def pretty_string(self, string, embedded, current_line):
-        """Format a string with proper quotes and handling of special characters."""
-        # Check if this is a multiline string
-        lines = string.split('\n')
-        if len(lines) > 1:
-            # For multiline strings containing null bytes, use explicit escaping
-            if '\\0' in string:
-                # string = string.replace('\0', '\\0')
-                add_r = "r"
-            else:
-                add_r = ""
-            return add_r + '"""' + string + '"""'
-
-        # For single line strings, handle quotes appropriately
-        quote_char = "'" if "'" not in string or '""' in string else '"'
-        quote_char_other = '"' if quote_char == "'" else "'"
-
-        result = ''
-        for char in string:
-            if char == quote_char:
-                result += '\\' + char
-            elif char == quote_char_other:
-                result += char
-            elif char == '\\':
-                result += '\\\\'
-            elif char == '\n':
-                result += '\\n'
-            elif char == '\r':
-                result += '\\r'
-            elif char == '\t':
-                result += '\\t'
-            elif char == '\0':
-                result += '\\0'
-            elif ord(char) < 32:  # Handle other control characters
-                result += f'\\x{ord(char):02x}'
-            else:
-                result += char
-
-        return quote_char + result + quote_char
-
-    def _handle_string_constant(self, node, value, is_joined=False):
+    def _handle_string_constant(self, node, value, is_joined=False, is_docstring=False):
         precedence = self.get__pp(node)
         embedded = ((precedence > Precedence.Expr) +
                     (precedence >= Precedence.Assign))
@@ -762,30 +844,31 @@ class SourceGenerator(ExplicitNodeVisitor):
         current_line = ''.join(current_line)
 
         if is_joined:
+            # TODO: Check this case.
             # Special case: check if this is just a string with both quote types
             if (len(node.values) == 1 and 
-                isinstance(node.values[0], ast.Str) and 
-                "'" in node.values[0].s and 
-                '"' in node.values[0].s):
-                string_value = node.values[0].s
+                isinstance(node.values[0], ast.Constant) and
+                "'" in node.values[0].value and
+                '"' in node.values[0].value):
+                string_value = node.values[0].value
                 if '\0' in string_value:
                     string_value = string_value.replace('\0', '\\0')
                 mystr = '"""' + string_value + '"""'
                 self.write('f' + mystr)
             else:
+                # Rest of the existing f-string handling...
                 index = len(result)
                 self.process_fstring_nodes(node)
                 fstring_content = ''.join(result[index:])
                 del result[index:]
                 self.colinfo = res_index, str_index
-
-                # Use the same quote type as the input when possible
                 quote_char = '"' if fstring_content.count("'") > fstring_content.count('"') else "'"
+                quote_char = '"""' if '"' in fstring_content and "'" in fstring_content else quote_char
                 mystr = quote_char + fstring_content + quote_char
                 self.write('f' + mystr)
         else:
             assert value is not None, "Node value cannot be None"
-            mystr = self.pretty_string(value, embedded, current_line)
+            mystr = pretty_string(value, embedded, current_line, is_docstring=is_docstring)
 
             if getattr(node, 'kind', False):
                 mystr = node.kind + mystr
